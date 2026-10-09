@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """gazebo_sign_injector - turn a PNG into a Gazebo traffic sign model.
 
+    python3 gazebo_sign_injector.py                          # editor window
+    python3 gazebo_sign_injector.py signs.csv                # editor with a manifest loaded
     python3 gazebo_sign_injector.py --name dur --shape octagon --png dur.png
     python3 gazebo_sign_injector.py --manifest signs.csv --out models
 
@@ -27,9 +29,16 @@ import math
 import os
 import re
 import shutil
+import struct
 import sys
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ImportError:  # headless: the command line still works
+    tk = None
 
 __version__ = "0.1.0"
 
@@ -357,8 +366,31 @@ def make_sign(spec: SignSpec, out_root: str, force: bool = False) -> str:
 
 
 # ======================================================================
-# Command line
+# Batches and manifests
 # ======================================================================
+
+def png_size(path: str) -> Tuple[int, int]:
+    with open(path, "rb") as f:
+        head = f.read(24)
+    if head[:8] != b"\x89PNG\r\n\x1a\n":
+        raise SignError(f"{path} is not a PNG file")
+    return struct.unpack(">II", head[16:24])
+
+
+def generate(specs: List[SignSpec], out: str, force: bool = False) -> List[str]:
+    """Check every spec first, then write. Nothing is written if any check fails."""
+    tokens = {}
+    for s in specs:
+        s.validate()
+        tok = slug(s.name)
+        if tok in tokens:
+            raise SignError(f"{s.name!r} and {tokens[tok]!r} both become model name {tok!r}")
+        tokens[tok] = s.name
+        if os.path.exists(os.path.join(out, tok)) and not force:
+            raise SignError(f"{os.path.join(out, tok)} already exists (use --force to replace it)")
+    os.makedirs(out, exist_ok=True)
+    return [make_sign(s, out, force=force) for s in specs]
+
 
 def read_manifest(path: str, defaults: SignSpec) -> List[SignSpec]:
     base = os.path.dirname(os.path.abspath(path))
@@ -381,9 +413,292 @@ def read_manifest(path: str, defaults: SignSpec) -> List[SignSpec]:
     return specs
 
 
+def write_manifest(path: str, specs: List[SignSpec]) -> None:
+    base = os.path.dirname(os.path.abspath(path))
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        f.write("# name,shape,png[,width[,height]]\n")
+        w = csv.writer(f)
+        for s in specs:
+            try:
+                png = os.path.relpath(os.path.abspath(s.png), base) if s.png else ""
+            except ValueError:  # different drive on Windows
+                png = os.path.abspath(s.png)
+            row = [s.name, s.shape, png, f"{s.width:g}"]
+            if s.shape == "rectangle" and s.height:
+                row.append(f"{s.height:g}")
+            w.writerow(row)
+
+
+# ======================================================================
+# Editor window (tkinter)
+# ======================================================================
+
+class App:
+    PREVIEW = 220
+
+    def __init__(self, root, manifest: Optional[str] = None):
+        self.root = root
+        root.title("Gazebo Sign Injector")
+        root.minsize(980, 610)
+        style = ttk.Style(root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        self.specs: List[SignSpec] = []
+        self.manifest = manifest
+        self._img = None  # keep a reference to the preview image
+
+        top = ttk.Frame(root, padding=(12, 12, 12, 0))
+        top.pack(fill="x")
+        self.out_var = tk.StringVar(value=os.path.abspath("models"))
+        ttk.Label(top, text="Output").pack(side="left")
+        ttk.Entry(top, textvariable=self.out_var, width=50).pack(side="left", padx=6, fill="x", expand=True)
+        ttk.Button(top, text="Browse…", command=self._browse_out).pack(side="left")
+        ttk.Button(top, text="Open CSV…", command=self.open_csv).pack(side="left", padx=(12, 0))
+        ttk.Button(top, text="Save CSV…", command=self.save_csv).pack(side="left", padx=(6, 0))
+
+        self.status = tk.StringVar()
+        ttk.Label(root, textvariable=self.status, anchor="w", padding=(12, 0, 12, 8)).pack(side="bottom", fill="x")
+        bottom = ttk.Frame(root, padding=(12, 0, 12, 8))
+        bottom.pack(side="bottom", fill="x")
+        body = ttk.Frame(root, padding=12)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        cols = (("Name", 140), ("Shape", 100), ("Size (m)", 80), ("PNG", 200))
+        self.tree = ttk.Treeview(body, columns=[c for c, _ in cols], show="headings", height=14, selectmode="browse")
+        for c, w in cols:
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=w, minwidth=50)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.bind("<<TreeviewSelect>>", self._selected)
+
+        side = ttk.Frame(body, padding=(12, 0, 0, 0))
+        side.grid(row=0, column=1, sticky="n")
+        self.v = {k: tk.StringVar(value=d) for k, d in
+                  (("name", "sign_1"), ("shape", "circle"), ("png", ""), ("width", "0.6"), ("height", ""))}
+        rows = (("Name", "name"), ("Shape", "shape"), ("PNG", "png"), ("Width (m)", "width"),
+                ("Height (m)", "height"))
+        for r, (label, key) in enumerate(rows):
+            ttk.Label(side, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            if key == "shape":
+                w = ttk.Combobox(side, textvariable=self.v[key], values=SHAPES, state="readonly", width=24)
+            else:
+                w = ttk.Entry(side, textvariable=self.v[key], width=26)
+            w.grid(row=r, column=1, sticky="ew", padx=(8, 0), pady=2)
+            if key == "png":
+                ttk.Button(side, text="…", width=3, command=self._browse_png).grid(row=r, column=2, padx=(4, 0))
+        ttk.Label(side, text="Height is used for rectangles only.", foreground="#666").grid(
+            row=len(rows), column=0, columnspan=3, sticky="w")
+        for key in ("shape", "png", "width", "height"):
+            self.v[key].trace_add("write", lambda *_: self._preview())
+
+        self.canvas = tk.Canvas(side, width=self.PREVIEW, height=self.PREVIEW, highlightthickness=0, bg="#d9d9d9")
+        self.canvas.grid(row=len(rows) + 2, column=0, columnspan=3, pady=(10, 4))
+        self.note = tk.StringVar()
+        ttk.Label(side, textvariable=self.note, foreground="#a33", wraplength=300, justify="left").grid(
+            row=len(rows) + 3, column=0, columnspan=3, sticky="w")
+        btns = ttk.Frame(side)
+        btns.grid(row=len(rows) + 1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Button(btns, text="Add", command=self.add).pack(side="left")
+        ttk.Button(btns, text="Update", command=self.update).pack(side="left", padx=6)
+        ttk.Button(btns, text="Remove", command=self.remove).pack(side="left")
+
+        self.center_var = tk.StringVar(value="1.9")
+        self.pole_var, self.base_var, self.force_var = tk.BooleanVar(value=True), tk.BooleanVar(value=True), \
+            tk.BooleanVar(value=False)
+        ttk.Label(bottom, text="Sign centre height (m)").pack(side="left")
+        ttk.Entry(bottom, textvariable=self.center_var, width=6).pack(side="left", padx=(6, 14))
+        ttk.Checkbutton(bottom, text="Pole", variable=self.pole_var).pack(side="left")
+        ttk.Checkbutton(bottom, text="Base", variable=self.base_var).pack(side="left", padx=8)
+        ttk.Checkbutton(bottom, text="Replace existing", variable=self.force_var).pack(side="left")
+        ttk.Button(bottom, text="Generate all", command=self.generate).pack(side="right")
+
+        if manifest:
+            self._load(manifest)
+        self._preview()
+
+    # ----------------------------------------------------------- list
+    def _refresh(self, select: Optional[int] = None) -> None:
+        self.tree.delete(*self.tree.get_children())
+        for i, s in enumerate(self.specs):
+            w, h = s.size() if s.shape in SHAPES else (s.width, s.height or s.width)
+            self.tree.insert("", "end", iid=str(i), values=(s.name, s.shape, f"{w:.3g} x {h:.3g}",
+                                                            os.path.basename(s.png)))
+        if select is not None and 0 <= select < len(self.specs):
+            self.tree.selection_set(str(select))
+        self.status.set(f"{len(self.specs)} signs" + (f" from {self.manifest}" if self.manifest else ""))
+
+    def _form_spec(self) -> SignSpec:
+        try:
+            width = float(self.v["width"].get())
+            hs = self.v["height"].get().strip()
+            height = float(hs) if hs else None
+        except ValueError as exc:
+            raise SignError("width and height must be numbers") from exc
+        s = SignSpec(self.v["name"].get().strip(), self.v["shape"].get(), self.v["png"].get().strip(), width, height)
+        slug(s.name)
+        return s
+
+    def _selected(self, _e=None) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            return
+        s = self.specs[int(sel[0])]
+        png = os.path.relpath(s.png) if s.png and not os.path.relpath(s.png).startswith("..") else s.png
+        for k, val in (("name", s.name), ("shape", s.shape), ("png", png), ("width", f"{s.width:g}"),
+                       ("height", f"{s.height:g}" if s.height else "")):
+            self.v[k].set(val)
+
+    def add(self) -> None:
+        try:
+            self.specs.append(self._form_spec())
+        except SignError as exc:
+            messagebox.showerror("Add", str(exc), parent=self.root)
+            return
+        self._refresh(len(self.specs) - 1)
+
+    def update(self) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Update", "Select a sign in the list first.", parent=self.root)
+            return
+        try:
+            self.specs[int(sel[0])] = self._form_spec()
+        except SignError as exc:
+            messagebox.showerror("Update", str(exc), parent=self.root)
+            return
+        self._refresh(int(sel[0]))
+
+    def remove(self) -> None:
+        sel = self.tree.selection()
+        if sel:
+            del self.specs[int(sel[0])]
+            self._refresh()
+
+    # -------------------------------------------------------- preview
+    def _preview(self) -> None:
+        c, size = self.canvas, self.PREVIEW
+        c.delete("all")
+        self.note.set("")
+        try:
+            s = self._form_spec()
+            sw, sh = SignSpec("x", s.shape, "", s.width, s.height).size()
+        except (SignError, ValueError):
+            return
+        scale = (size - 20) / max(sw, sh)
+        bw, bh = sw * scale, sh * scale
+        x0, y0 = (size - bw) / 2, (size - bh) / 2
+        if s.png and os.path.isfile(s.png):
+            try:
+                iw, ih = png_size(s.png)
+                img = tk.PhotoImage(file=s.png)
+                # PhotoImage only scales by whole numbers: zoom up, then subsample down.
+                zoom = max(1, min(8, int(round(4 * max(bw / iw, bh / ih)))))
+                sub = max(1, int(round(zoom * max(iw / bw, ih / bh))))
+                self._img = img.zoom(zoom).subsample(sub)
+                c.create_image(size / 2, size / 2, image=self._img)
+                if abs(iw / ih - sw / sh) > 0.03 * (sw / sh):
+                    self.note.set(f"Image is {iw}x{ih} ({iw / ih:.2f}:1) but the sign is {sw / sh:.2f}:1; "
+                                  "it will be stretched.")
+            except (tk.TclError, SignError, OSError) as exc:
+                self.note.set(f"Cannot show image: {exc}")
+        elif s.png:
+            self.note.set("PNG not found")
+        pts = outline(s.shape, sw, sh)
+        xs, zs = [p[0] for p in pts], [p[1] for p in pts]
+        mx, mz = (min(xs) + max(xs)) / 2, (min(zs) + max(zs)) / 2
+        poly = [(size / 2 + (x - mx) * scale, size / 2 - (z - mz) * scale) for x, z in pts]
+        # Dim what falls outside the shape: a keyhole polygon (bounding box minus the shape).
+        box = [(x0, y0), (x0 + bw, y0), (x0 + bw, y0 + bh), (x0, y0 + bh), (x0, y0)]
+        hole = [poly[0]] + poly[::-1] + [poly[0]]
+        c.create_polygon(*[v for p in box + hole for v in p], fill="#d9d9d9", outline="")
+        c.create_polygon(*[v for p in poly for v in p], fill="", outline="#c00", width=2)
+        c.create_rectangle(x0, y0, x0 + bw, y0 + bh, outline="#888", dash=(3, 3))
+
+    # ------------------------------------------------------- file i/o
+    def _browse_out(self) -> None:
+        d = filedialog.askdirectory(title="Output directory")
+        if d:
+            self.out_var.set(d)
+
+    def _browse_png(self) -> None:
+        f = filedialog.askopenfilename(title="Sign image", filetypes=[("PNG", "*.png"), ("All files", "*")])
+        if f:
+            self.v["png"].set(f)
+            if self.v["name"].get().strip() in ("", "sign_1"):
+                try:
+                    self.v["name"].set(slug(os.path.splitext(os.path.basename(f))[0]))
+                except SignError:
+                    pass
+
+    def _load(self, path: str) -> None:
+        try:
+            self.specs = read_manifest(path, SignSpec("x", "square", ""))
+        except (SignError, OSError) as exc:
+            messagebox.showerror("Open", str(exc), parent=self.root)
+            return
+        self.manifest = path
+        self._refresh(0 if self.specs else None)
+        self._selected()
+
+    def open_csv(self) -> None:
+        f = filedialog.askopenfilename(title="Manifest", filetypes=[("CSV", "*.csv"), ("All files", "*")])
+        if f:
+            self._load(f)
+
+    def save_csv(self) -> None:
+        f = filedialog.asksaveasfilename(title="Save manifest", defaultextension=".csv",
+                                         initialfile=os.path.basename(self.manifest or "signs.csv"))
+        if f:
+            write_manifest(f, self.specs)
+            self.manifest = f
+            self._refresh()
+
+    def generate(self) -> None:
+        try:
+            center = float(self.center_var.get())
+        except ValueError:
+            messagebox.showerror("Generate", "Sign centre height must be a number", parent=self.root)
+            return
+        pole = self.pole_var.get()
+        specs = [SignSpec(s.name, s.shape, s.png, s.width, s.height, center, pole, pole and self.base_var.get())
+                 for s in self.specs]
+        if not specs:
+            messagebox.showinfo("Generate", "Add at least one sign.", parent=self.root)
+            return
+        try:
+            dirs = generate(specs, self.out_var.get().strip(), force=self.force_var.get())
+        except (SignError, OSError) as exc:
+            messagebox.showerror("Generate", str(exc), parent=self.root)
+            return
+        self.status.set(f"wrote {len(dirs)} models to {self.out_var.get().strip()}")
+
+
+def run_gui(manifest: Optional[str] = None) -> int:
+    if tk is None:
+        raise SignError("tkinter is not installed (on Ubuntu: sudo apt install python3-tk)")
+    root = tk.Tk()
+    App(root, manifest)
+    root.mainloop()
+    return 0
+
+
+# ======================================================================
+# Command line
+# ======================================================================
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or (len(argv) == 1 and not argv[0].startswith("-")):
+        try:  # no options: open the editor, optionally with a manifest
+            return run_gui(argv[0] if argv else None)
+        except SignError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
     p = argparse.ArgumentParser(prog="gazebo_sign_injector.py",
-                                description="Turn PNG images into Gazebo traffic sign models.")
+                                description="Turn PNG images into Gazebo traffic sign models. "
+                                            "Run without arguments for the editor window.")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--manifest", help="CSV with name,shape,png[,width[,height]] per line")
     p.add_argument("--name", help="model name (single sign)")
@@ -415,19 +730,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not (a.name and a.shape and a.png):
                 p.error("give --name, --shape and --png (or --manifest)")
             specs = [SignSpec(a.name, a.shape, a.png, width, height, a.height, defaults.pole, defaults.base)]
-        # Check everything before writing anything.
-        tokens = {}
-        for s in specs:
-            s.validate()
-            tok = slug(s.name)
-            if tok in tokens:
-                raise SignError(f"{s.name!r} and {tokens[tok]!r} both become model name {tok!r}")
-            tokens[tok] = s.name
-            if os.path.exists(os.path.join(a.out, tok)) and not a.force:
-                raise SignError(f"{os.path.join(a.out, tok)} already exists (use --force to replace it)")
-        os.makedirs(a.out, exist_ok=True)
-        for s in specs:
-            d = make_sign(s, a.out, force=a.force)
+        for d, s in zip(generate(specs, a.out, a.force), specs):
             w, h = s.size()
             print(f"{d}  ({s.shape}, {w:g} x {h:g} m)")
     except (SignError, OSError) as exc:

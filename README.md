@@ -12,9 +12,13 @@ generated meshes.*
 
 ## Usage
 
-Python 3.8+ with no extra packages.
+Python 3.8+. The editor window needs tkinter; the command line needs nothing
+else.
 
 ```bash
+python3 gazebo_sign_injector.py              # editor window
+python3 gazebo_sign_injector.py signs.csv    # editor with a manifest loaded
+
 # one sign
 python3 gazebo_sign_injector.py --name dur --shape octagon --png dur.png
 
@@ -32,11 +36,17 @@ Yol Ver,triangle_down,yol_ver.png,0.9
 Otopark,rectangle,otopark.png,1.0,0.5
 ```
 
+![Editor window](docs/gui.png)
+
+The editor lists the signs, shows each image cut to its shape (and warns when
+the image's aspect ratio does not match the sign), saves the list as a CSV
+manifest and generates all models with one click.
+
 Names are turned into model names (`Yol Ver` → `yol_ver`, Turkish characters
 included). All rows are checked before anything is written, and an existing
 model folder is only replaced with `--force`.
 
-| Option | Default | |
+| Option | Default | Meaning |
 |---|---|---|
 | `--size W [H]` | `0.6` | width in metres; rectangles take width and height |
 | `--height` | `1.9` | height of the sign centre above the ground |
